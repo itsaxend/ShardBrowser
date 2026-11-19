@@ -831,6 +831,9 @@ fn lease_now() -> u64 {
 
 /// A profile's session, keyed by the profile's id alone (space ''): it moves with the profile.
 const SESSION: &str = "session";
+/// A profile's cookies, stored apart from the session so they can be read or
+/// replaced without moving the whole session.
+const COOKIES: &str = "cookies";
 /// An extension's package, keyed by the item's space and id.
 const PACKAGE: &str = "package";
 const EXTENSION: &str = "extension";
@@ -847,6 +850,9 @@ fn card_aad(id: &str) -> String {
 }
 fn session_aad(id: &str) -> String {
     format!("session:{id}")
+}
+fn cookies_aad(id: &str) -> String {
+    format!("cookies:{id}")
 }
 fn package_aad(space: &str, id: &str) -> String {
     format!("package:{space}:{id}")
@@ -946,6 +952,7 @@ impl BodyRef {
 fn blob_aad(kind: &str, space: &str, id: &str) -> Result<String> {
     match kind {
         SESSION => Ok(session_aad(id)),
+        COOKIES => Ok(cookies_aad(id)),
         PACKAGE => Ok(package_aad(space, id)),
         other => bail!("unknown blob kind in the database: {other}"),
     }
@@ -2822,6 +2829,128 @@ impl Store {
         let meta = head_put(&tx, SESSION, "", id, current + 1, writer.member_id, up)?;
         tx.commit()?;
         Ok(Ok((p, meta)))
+    }
+
+    /// Read a profile's cookies blob (raw bytes) for a member allowed to see it.
+    /// Returns None when no cookies have been stored yet. No lease needed: a
+    /// device may read cookies without holding the profile open.
+    pub fn cookies_read(
+        &self,
+        space: &str,
+        id: &str,
+        member_id: &str,
+        authorize: impl FnOnce(&Standing, &TeamProfile) -> std::result::Result<(), Refusal>,
+    ) -> Result<std::result::Result<Option<(Vec<u8>, u64)>, Refusal>> {
+        let mut db = self.lock();
+        let tx = db.transaction()?;
+        let p = match profile_with_space(&tx, id)? {
+            None => return Ok(Err(Refusal::Missing)),
+            Some((_, sp)) if sp != space => return Ok(Err(Refusal::OtherSpace)),
+            Some((p, _)) => p,
+        };
+        if let Err(r) = authorize(&standing_in(&tx, member_id)?, &p) {
+            return Ok(Err(r));
+        }
+        let blob = blob_at(&tx, COOKIES, "", id)?;
+        let had = blob.is_some();
+        let mut buf = Vec::new();
+        let mut rev = 0u64;
+        if let Some((ref meta, body)) = blob {
+            rev = meta.rev;
+            let bref = BodyRef { body, size: meta.size, aad: cookies_aad(id) };
+            for seq in 0..bref.chunks() {
+                let sealed: Vec<u8> = tx
+                    .query_row(
+                        "SELECT sealed FROM chunks WHERE body = ?1 AND seq = ?2",
+                        params![bref.body, seq as i64],
+                        |r| r.get(0),
+                    )
+                    .optional()?
+                    .with_context(|| format!("{}: chunk {seq} is missing", cookies_aad(id)))?;
+                let last = seq + 1 == bref.chunks();
+                let plain = self.vault.open(&chunk_aad(&bref.aad, bref.body, seq, last), &sealed)?;
+                let want = if last {
+                    bref.size - (bref.chunks() - 1) * CHUNK as u64
+                } else {
+                    CHUNK as u64
+                };
+                if plain.len() as u64 != want {
+                    bail!("{}: chunk {seq} is {} bytes, not {want}", cookies_aad(id), plain.len());
+                }
+                buf.extend_from_slice(&plain);
+            }
+        }
+        tx.commit()?;
+        Ok(Ok(if had { Some((buf, rev)) } else { None }))
+    }
+
+    /// Replace a profile's cookies blob. `base` is the revision it was based
+    /// on (0 for the first). No lease needed: writes are judged by permission
+    /// and etag alone, so a device can update cookies without holding the
+    /// profile open. Returns the new revision's meta.
+    pub fn cookies_write(
+        &self,
+        space: &str,
+        id: &str,
+        member_id: &str,
+        base: u64,
+        data: &[u8],
+        authorize: impl FnOnce(&Standing, &TeamProfile, bool) -> std::result::Result<(), Refusal>,
+    ) -> Result<std::result::Result<BlobMeta, Refusal>> {
+        let mut up = self.body_begin(cookies_aad(id))?;
+        let mut rest = data;
+        while rest.len() > CHUNK {
+            self.upload_put(&mut up, &rest[..CHUNK], false)?;
+            rest = &rest[CHUNK..];
+        }
+        self.upload_put(&mut up, rest, true)?;
+        let mut db = self.lock();
+        let tx = db.transaction()?;
+        let p = match profile_with_space(&tx, id)? {
+            None => return Ok(Err(Refusal::Missing)),
+            Some((_, sp)) if sp != space => return Ok(Err(Refusal::OtherSpace)),
+            Some((p, _)) => p,
+        };
+        if let Err(r) = authorize(&standing_in(&tx, member_id)?, &p, false) {
+            // let go body
+            self.let_go(up.body);
+            return Ok(Err(r));
+        }
+        let current = blob_at(&tx, COOKIES, "", id)?.map_or(0, |(m, _)| m.rev);
+        if base != current {
+            self.let_go(up.body);
+            return Ok(Err(Refusal::SessionStale { current }));
+        }
+        let meta = head_put(&tx, COOKIES, "", id, current + 1, member_id, &up)?;
+        tx.commit()?;
+        self.let_go(up.body);
+        Ok(Ok(meta))
+    }
+
+    /// Test setup: a whole cookies blob uploaded and judged in one call.
+    #[cfg(test)]
+    pub fn cookies_write_simple(
+        &self,
+        space: &str,
+        id: &str,
+        member_id: &str,
+        base: u64,
+        data: Vec<u8>,
+        authorize: impl FnOnce(&Standing, &TeamProfile, bool) -> std::result::Result<(), Refusal>,
+    ) -> Result<std::result::Result<BlobMeta, Refusal>> {
+        self.cookies_write(space, id, member_id, base, &data, authorize)
+    }
+
+    /// Test setup...
+    #[cfg(test)]
+    pub fn cookies_read_simple(
+        &self,
+        space: &str,
+        id: &str,
+        member_id: &str,
+        authorize: impl FnOnce(&Standing, &TeamProfile) -> std::result::Result<(), Refusal>,
+    ) -> Result<std::result::Result<Option<(Vec<u8>, u64)>, Refusal>> {
+        self.cookies_read(space, id, member_id, authorize)
     }
 
     /// Test setup: a whole session uploaded and judged in one call.

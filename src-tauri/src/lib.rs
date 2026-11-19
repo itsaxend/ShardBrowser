@@ -1995,26 +1995,42 @@ pub fn is_profile_running(profile_id: &str) -> bool {
 }
 
 #[tauri::command]
-fn cookies_export(profile_id: String) -> Result<Vec<space::cookies::Cookie>, String> {
+async fn cookies_export(profile_id: String) -> Result<Vec<space::cookies::Cookie>, String> {
+    if let Some(team) = crate::team::active_team() {
+        if is_profile_running(&profile_id) {
+            let pass = crate::space::open::cookie_pass(&team, &profile_id).await.map_err(|e| e.to_string())?;
+            return space::cookies::export(&pass).map_err(|e| e.to_string());
+        }
+        let (blob, _) = crate::space::open::cookies_fetch(&team, &profile_id).await.map_err(|e| e.to_string())?;
+        let cookies: Vec<space::cookies::Cookie> = blob
+            .and_then(|b| serde_json::from_slice(&b).ok())
+            .unwrap_or_default();
+        return Ok(cookies);
+    }
     let pass = space::perm::cookies(&profile_id).map_err(|e| e.to_string())?;
     space::cookies::export(&pass).map_err(|e| e.to_string())
 }
 
 /// Export cookies to a user-picked path; returns count written.
 #[tauri::command]
-fn cookies_export_to_file(profile_id: String, path: String) -> Result<usize, String> {
-    let pass = space::perm::cookies(&profile_id).map_err(|e| e.to_string())?;
-    let cookies = space::cookies::export(&pass).map_err(|e| e.to_string())?;
+async fn cookies_export_to_file(profile_id: String, path: String) -> Result<usize, String> {
+    let cookies = cookies_export(profile_id).await?;
     let json = serde_json::to_string_pretty(&cookies).map_err(|e| e.to_string())?;
     std::fs::write(&path, json).map_err(|e| e.to_string())?;
     Ok(cookies.len())
 }
 
 #[tauri::command]
-fn cookies_import(profile_id: String, cookies: Vec<space::cookies::Cookie>) -> Result<usize, String> {
+async fn cookies_import(profile_id: String, cookies: Vec<space::cookies::Cookie>) -> Result<usize, String> {
     // Running browser would clobber the import on exit.
     if is_profile_running(&profile_id) {
         return Err("stop the profile before importing cookies".into());
+    }
+    if let Some(team) = crate::team::active_team() {
+        let bytes = serde_json::to_vec(&cookies).map_err(|e| e.to_string())?;
+        let (_, etag) = crate::space::open::cookies_fetch(&team, &profile_id).await.unwrap_or((None, 0));
+        crate::space::open::cookies_store(&team, &profile_id, etag, &bytes).await.map_err(|e| e.to_string())?;
+        return Ok(cookies.len());
     }
     let pass = space::perm::cookies(&profile_id).map_err(|e| e.to_string())?;
     space::cookies::import(&pass, &cookies).map_err(|e| e.to_string())

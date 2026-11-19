@@ -550,6 +550,15 @@ async fn team_input(team: &str, start: &Granted<Start>, cdp: Option<&Granted<Coo
     let opened = crate::space::open::open_team(team, start, cdp.is_some()).await?;
     let id = start.profile_id();
     let name = opened.stored.config.get("name").and_then(|v| v.as_str()).filter(|n| !n.trim().is_empty()).unwrap_or(id);
+    // Apply the stored cookies (fast path) into the session so the browser
+    // sees cookies imported between runs. Best-effort; never blocks launch.
+    if let Ok((Some(bytes), _)) = crate::space::open::cookies_fetch(team, id).await {
+        if let Ok(cookies) = serde_json::from_slice::<Vec<crate::space::cookies::Cookie>>(&bytes) {
+            if let Ok(p) = crate::space::open::cookie_pass(team, id).await {
+                let _ = crate::space::cookies::import(&p, &cookies);
+            }
+        }
+    }
     let extensions = extensions::unpack_for_team(team, (id, name), &opened.stored.meta.extensions, &opened.ext).await;
     Ok(LaunchInput {
         profile_id: start.profile_id().to_string(),

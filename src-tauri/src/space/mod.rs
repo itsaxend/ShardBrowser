@@ -664,6 +664,16 @@ pub mod profile {
     }
 
     pub fn user_data_dir(id: &str) -> Result<PathBuf> {
+        // A team profile lives under team-open while it is open here; its cookies
+        // are only readable/writable then. Refuse cleanly when it is not open.
+        if let Some(team) = crate::team::active_team() {
+            let safe = super::open::safe(&team);
+            let p = crate::store::data_root()?.join("team-open").join(safe).join(id);
+            if !p.exists() {
+                anyhow::bail!("team profile is not open here: start it first");
+            }
+            return Ok(p);
+        }
         local::user_data_dir(id)
     }
 

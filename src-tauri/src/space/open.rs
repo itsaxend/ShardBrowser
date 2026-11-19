@@ -12,6 +12,7 @@ use std::sync::{Arc, Mutex, MutexGuard, OnceLock};
 use std::time::Duration;
 
 use anyhow::{bail, Result};
+use base64::Engine as _;
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 use tokio::sync::Notify;
@@ -312,6 +313,54 @@ pub async fn passes(team: &str, id: &str, cdp: bool) -> Result<(Granted<Start>, 
     let start = perm::team_pass::<Start>(team, &seen)?;
     let cookies = if cdp { Some(perm::team_pass::<Cookies>(team, &seen)?) } else { None };
     Ok((start, cookies))
+}
+
+/// A pass to read/write a team profile's cookies, judged on the server's row now.
+pub async fn cookie_pass(team: &str, id: &str) -> Result<Granted<Cookies>> {
+    let client = Home::team(team).client()?;
+    if perm::held_epoch(team).is_none() {
+        let issued = client.permission().await.map_err(|e| from_team(e.into(), id))?;
+        perm::accept(team, &issued.permission).map_err(|e| anyhow::anyhow!("the team's permission did not check out: {e}"))?;
+    }
+    let mut seen = looked(&client, team, id).await?;
+    if perm::moved_since(team, &seen) {
+        seen = looked(&client, team, id).await?;
+    }
+    perm::team_pass::<Cookies>(team, &seen)
+}
+
+/// Fetch the profile's cookies blob (encrypted, as stored) from the team
+/// server, together with its revision. Fast: only the cookies file, not the
+/// whole session. Returns (None, 0) when the server has none yet.
+pub async fn cookies_fetch(team: &str, id: &str) -> Result<(Option<Vec<u8>>, u64)> {
+    let client = Home::team(team).client().map_err(|e| anyhow::anyhow!("{e}"))?;
+    if perm::held_epoch(team).is_none() {
+        let issued = client.permission().await.map_err(|e| from_team(e.into(), id))?;
+        perm::accept(team, &issued.permission).map_err(|e| anyhow::anyhow!("the team's permission did not check out: {e}"))?;
+    }
+    let v: serde_json::Value = client.get(&format!("/profiles/{}/cookies", super::admin::seg(id).map_err(|e| anyhow::anyhow!("{e}"))?)).await.map_err(|e| from_team(e.into(), id))?;
+    let etag = v.get("etag").and_then(|x| x.as_u64()).unwrap_or(0);
+    let bytes = match v.get("cookies").and_then(|x| x.as_str()) {
+        Some(b64) => Some(base64::engine::general_purpose::STANDARD.decode(b64).map_err(|e| anyhow::anyhow!("bad base64: {e}"))?),
+        None => None,
+    };
+    Ok((bytes, etag))
+}
+
+/// Replace the profile's cookies blob on the team server. `base` is the
+/// revision it was based on (0 for the first). Returns the new revision.
+pub async fn cookies_store(team: &str, id: &str, base: u64, data: &[u8]) -> Result<u64> {
+    let client = Home::team(team).client().map_err(|e| anyhow::anyhow!("{e}"))?;
+    if perm::held_epoch(team).is_none() {
+        let issued = client.permission().await.map_err(|e| from_team(e.into(), id))?;
+        perm::accept(team, &issued.permission).map_err(|e| anyhow::anyhow!("the team's permission did not check out: {e}"))?;
+    }
+    let body = serde_json::json!({
+        "cookies": base64::engine::general_purpose::STANDARD.encode(data),
+        "etag": base,
+    });
+    let v: serde_json::Value = client.json(hyper::Method::PUT, &format!("/profiles/{}/cookies", super::admin::seg(id).map_err(|e| anyhow::anyhow!("{e}"))?), Some(&body)).await.map_err(|e| from_team(e.into(), id))?;
+    Ok(v.get("etag").and_then(|x| x.as_u64()).unwrap_or(0))
 }
 
 /// The profile as the team's rows show it to this member, under the rules held now.
@@ -845,6 +894,20 @@ impl Session {
             End::Keep => Outcome::Kept,
             End::Discard => Outcome::Discarded,
         };
+        // Best-effort: keep the fast cookies blob in sync with the session that
+        // was just uploaded, so manual cookie I/O stays correct between runs.
+        if end == End::Upload && matches!(outcome, Outcome::Saved(_)) && !self.home.mine {
+            let team = self.home.team.clone();
+            let id = self.id.clone();
+            if let Ok(pass) = cookie_pass(&team, &id).await {
+                if let Ok(cookies) = crate::space::cookies::export(&pass) {
+                    if let Ok(bytes) = serde_json::to_vec(&cookies) {
+                        let etag = cookies_fetch(&team, &id).await.map(|x| x.1).unwrap_or(0);
+                        let _ = cookies_store(&team, &id, etag, &bytes).await;
+                    }
+                }
+            }
+        }
         // Kept: the lease stays, so nobody opens the older session meanwhile.
         let keep = end == End::Keep || matches!(outcome, Outcome::Unsent(_));
         self.stop_watch().await;

@@ -226,6 +226,7 @@ pub fn router(state: AppState) -> Router {
         )
         .route("/profiles/:id/lease", post(lease_take).delete(lease_give_back))
         .route("/profiles/:id/session", get(session_get).put(session_put))
+        .route("/profiles/:id/cookies", get(cookies_get).put(cookies_put))
         .route("/profiles/:id/to-me", post(profile_to_me))
         .route("/proxies", get(proxies_list))
         .route(
@@ -241,6 +242,7 @@ pub fn router(state: AppState) -> Router {
         )
         .route("/me/profiles/:id/lease", post(my_lease_take).delete(my_lease_give_back))
         .route("/me/profiles/:id/session", get(my_session_get).put(my_session_put))
+        .route("/me/profiles/:id/cookies", get(my_cookies_get).put(my_cookies_put))
         .route("/me/profiles/:id/to-team", post(my_profile_to_team))
         .route("/me/proxies", get(my_proxies_list))
         .route(
@@ -1933,6 +1935,99 @@ async fn my_session_put(
     let c = require_member(&st, &headers)?;
     let mine = c.mine();
     write_session(&st, &c, &mine, id, q, &headers, body).await
+}
+
+// ---- cookies (separate blob, fast path) ----
+
+#[derive(Deserialize)]
+struct CookiesPutReq {
+    cookies: String, // base64-encoded encrypted cookie db bytes
+    #[serde(default)]
+    etag: u64,
+}
+
+async fn cookies_get(
+    State(st): State<AppState>,
+    headers: HeaderMap,
+    Path(id): Path<String>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    let c = require_member(&st, &headers)?;
+    let p = visible_profile(&st, &c, &id)?;
+    if !c.may(Action::Cookies, &Target::profile(&id, &p.folder)) {
+        return Err(ApiError::forbidden());
+    }
+    let res = st.store.cookies_read(TEAM, &id, &c.member.id, |s, p| {
+        let g = live(s)?;
+        if !allows(g, Action::Cookies, &Target::profile(&id, &p.folder)) {
+            Err(Refusal::Forbidden)
+        } else {
+            Ok(())
+        }
+    })?;
+    match res {
+        Err(r) => Err(r.into()),
+        Ok(None) => Ok(Json(serde_json::json!({ "cookies": null, "etag": 0 }))),
+        Ok(Some((bytes, rev))) => Ok(Json(serde_json::json!({ "cookies": STANDARD.encode(bytes), "etag": rev })))
+    }
+}
+
+async fn my_cookies_get(
+    State(st): State<AppState>,
+    headers: HeaderMap,
+    Path(id): Path<String>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    let c = require_member(&st, &headers)?;
+    own_profile(&st, &c, &id)?;
+    let space = c.mine();
+    let res = st.store.cookies_read(&space, &id, &c.member.id, |s, _| still_on(s))?;
+    match res {
+        Err(r) => Err(r.into()),
+        Ok(None) => Ok(Json(serde_json::json!({ "cookies": null, "etag": 0 }))),
+        Ok(Some((bytes, rev))) => Ok(Json(serde_json::json!({ "cookies": STANDARD.encode(bytes), "etag": rev }))),
+    }
+}
+
+async fn cookies_put(
+    State(st): State<AppState>,
+    headers: HeaderMap,
+    Path(id): Path<String>,
+    Json(body): Json<CookiesPutReq>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    let c = require_member(&st, &headers)?;
+    let p = visible_profile(&st, &c, &id)?;
+    if !c.may(Action::Cookies, &Target::profile(&id, &p.folder)) {
+        return Err(ApiError::forbidden());
+    }
+    let data = STANDARD.decode(&body.cookies).map_err(|_| ApiError::bad("bad base64"))?;
+    let res = st.store.cookies_write(TEAM, &id, &c.member.id, body.etag, &data, |s, p, _| {
+        let g = live(s)?;
+        if !allows(g, Action::Cookies, &Target::profile(&id, &p.folder)) {
+            Err(Refusal::Forbidden)
+        } else {
+            Ok(())
+        }
+    })?;
+    match res {
+        Err(r) => Err(r.into()),
+        Ok(meta) => Ok(Json(serde_json::json!({ "etag": meta.rev }))),
+    }
+}
+
+async fn my_cookies_put(
+    State(st): State<AppState>,
+    headers: HeaderMap,
+    Path(id): Path<String>,
+    Json(body): Json<CookiesPutReq>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    let c = require_member(&st, &headers)?;
+    own_profile(&st, &c, &id)?;
+    let space = c.mine();
+    let data = STANDARD.decode(&body.cookies).map_err(|_| ApiError::bad("bad base64"))?;
+    let res = st.store.cookies_write(&space, &id, &c.member.id, body.etag, &data, |s, _, _| still_on(s))?;
+    match res {
+        Err(r) => Err(r.into()),
+        Ok(meta) => Ok(Json(serde_json::json!({ "etag": meta.rev }))),
+    }
 }
 
 /// Take a session from the device holding the lease, whatever its rights did
@@ -3790,12 +3885,12 @@ mod tests {
         let mut sam = st.hub.subscribe(&sam_id).await;
 
         let (code, _) =
-            answer(&st, ask("POST", "/admin/folders", &a), Some(json!({ "name": "Client Z" }))).await;
+            answer(&st, ask("POST", "/admin/folders", &a), Some(serde_json::json!({ "name": "Client Z" }))).await;
         assert_eq!(code, StatusCode::CREATED);
         let (code, _) = answer(
             &st,
             ask("PATCH", "/admin/folders/Client%20Z", &a),
-            Some(json!({ "name": "Client Y" })),
+            Some(serde_json::json!({ "name": "Client Y" })),
         )
         .await;
         assert_eq!(code, StatusCode::OK);
@@ -4137,11 +4232,11 @@ mod tests {
     }
 
     fn profile_json(name: &str, folder: &str, data: &[u8]) -> Value {
-        json!({ "name": name, "folder": folder, "data": STANDARD.encode(data) })
+        serde_json::json!({ "name": name, "folder": folder, "data": STANDARD.encode(data) })
     }
 
     fn proxy_json(name: &str) -> Value {
-        json!({ "name": name, "kind": "socks5", "country": "JP", "data": STANDARD.encode(b"host:port") })
+        serde_json::json!({ "name": name, "kind": "socks5", "country": "JP", "data": STANDARD.encode(b"host:port") })
     }
 
     fn based_on(mut body: Value, revision: u64) -> Value {
@@ -4203,7 +4298,7 @@ mod tests {
             assert_eq!(code, StatusCode::NOT_FOUND, "{method} {uri}");
             assert_eq!(
                 body,
-                json!({ "error": "no such thing", "code": "not_found" }),
+                serde_json::json!({ "error": "no such thing", "code": "not_found" }),
                 "nothing says where it is: {method} {uri}"
             );
         }
@@ -4213,7 +4308,7 @@ mod tests {
             assert_eq!(code, StatusCode::NOT_FOUND, "PUT {uri}");
         }
         let (code, _) =
-            answer(&st, ask("POST", "/me/profiles/p-own/to-team", &sam), Some(json!({}))).await;
+            answer(&st, ask("POST", "/me/profiles/p-own/to-team", &sam), Some(serde_json::json!({}))).await;
         assert_eq!(code, StatusCode::NOT_FOUND);
 
         // Still Vera's, byte for byte, and in none of Sam's lists.
@@ -4237,7 +4332,7 @@ mod tests {
         let calls = [
             ("PUT", "/me/profiles/p-own", Some(profile_json("My shop", "", b"x")), StatusCode::CREATED),
             ("PUT", "/me/proxies/x-own", Some(proxy_json("Home")), StatusCode::CREATED),
-            ("POST", "/me/folders", Some(json!({ "name": "Private" })), StatusCode::CREATED),
+            ("POST", "/me/folders", Some(serde_json::json!({ "name": "Private" })), StatusCode::CREATED),
             ("DELETE", "/me/profiles/p-own", None, StatusCode::NO_CONTENT),
             ("DELETE", "/me/proxies/x-own", None, StatusCode::NO_CONTENT),
         ];
@@ -4360,7 +4455,7 @@ mod tests {
     async fn a_write_based_on_an_old_revision_is_refused_with_the_current_one() {
         let st = state();
         let (_, vera) = member(&st, "Vera", everything()).await;
-        let stale = json!({ "error": "changed since you read it", "code": "stale", "current_revision": 2 });
+        let stale = serde_json::json!({ "error": "changed since you read it", "code": "stale", "current_revision": 2 });
 
         for (uri, body) in [
             ("/profiles/p1", profile_json("Shop", "Ads", b"v")),
@@ -4384,7 +4479,7 @@ mod tests {
     async fn a_delete_based_on_an_old_revision_is_refused_with_the_current_one() {
         let st = state();
         let (_, vera) = member(&st, "Vera", everything()).await;
-        let stale = json!({ "error": "changed since you read it", "code": "stale", "current_revision": 2 });
+        let stale = serde_json::json!({ "error": "changed since you read it", "code": "stale", "current_revision": 2 });
         let del = |uri: &str, query: &str| ask("DELETE", &format!("{uri}{query}"), &vera);
 
         for (uri, body) in [
@@ -4504,7 +4599,7 @@ mod tests {
         assert_eq!(code, StatusCode::CREATED);
 
         // Another folder, and no folder at all, are not Ads.
-        for body in [json!({ "folder": "Shops" }), json!({})] {
+        for body in [serde_json::json!({ "folder": "Shops" }), serde_json::json!({})] {
             let (code, _) = answer(&st, ask("POST", to_team, &vera), Some(body)).await;
             assert_eq!(code, StatusCode::FORBIDDEN);
         }
@@ -4516,7 +4611,7 @@ mod tests {
 
         let mut sam_live = st.hub.subscribe(&sam_id).await;
         let mut vera_live = st.hub.subscribe(&vera_id).await;
-        let (code, moved) = answer(&st, ask("POST", to_team, &vera), Some(json!({ "folder": "Ads" }))).await;
+        let (code, moved) = answer(&st, ask("POST", to_team, &vera), Some(serde_json::json!({ "folder": "Ads" }))).await;
         assert_eq!(code, StatusCode::OK);
         assert_eq!(moved["folder"], "Ads");
         assert_eq!(st.store.profile_meta("p-own").unwrap().unwrap().1, TEAM);
@@ -4601,7 +4696,7 @@ mod tests {
             ],
         )
         .await;
-        let f = |name: &str, color: &str, profiles: u64| json!({ "name": name, "color": color, "profiles": profiles });
+        let f = |name: &str, color: &str, profiles: u64| serde_json::json!({ "name": name, "color": color, "profiles": profiles });
 
         // Ads for the one profile in it she may see, and counted as one, not
         // two. Granted by its own rule, though empty. Shops and Empty, never.
@@ -4623,9 +4718,9 @@ mod tests {
         let st = state();
         let a = admin(&st);
         let (code, made) =
-            answer(&st, ask("POST", "/admin/folders", &a), Some(json!({ "name": "Ads", "color": "orange" }))).await;
+            answer(&st, ask("POST", "/admin/folders", &a), Some(serde_json::json!({ "name": "Ads", "color": "orange" }))).await;
         assert_eq!(code, StatusCode::CREATED);
-        assert_eq!(made, json!({ "name": "Ads", "color": "orange", "profiles": 0 }));
+        assert_eq!(made, serde_json::json!({ "name": "Ads", "color": "orange", "profiles": 0 }));
 
         let (vera_id, vera) = member(&st, "Vera", vec![allow(folder("Ads"), Action::See)]).await;
         let (sam_id, _) = member(&st, "Sam", vec![allow(Scope::Team, Action::See)]).await;
@@ -4643,11 +4738,11 @@ mod tests {
         let (code, renamed) = answer(
             &st,
             ask("PATCH", "/admin/folders/Ads", &a),
-            Some(json!({ "name": "Advertising", "color": "blue" })),
+            Some(serde_json::json!({ "name": "Advertising", "color": "blue" })),
         )
         .await;
         assert_eq!(code, StatusCode::OK);
-        assert_eq!(renamed, json!({ "name": "Advertising", "color": "blue", "profiles": 0 }));
+        assert_eq!(renamed, serde_json::json!({ "name": "Advertising", "color": "blue", "profiles": 0 }));
         assert_eq!(regranted(heard(&mut vera_live)), vec![Event::GrantsChanged { epoch: epoch(&vera_id) }]);
         // Sam's rules never named it, but he sees one folder go and another come.
         assert_eq!(regranted(heard(&mut sam_live)), vec![Event::GrantsChanged { epoch: epoch(&sam_id) }]);
@@ -4673,16 +4768,16 @@ mod tests {
         let a = admin(&st);
         let (_, vera) = member(&st, "Vera", vec![allow(Scope::Team, Action::See)]).await;
 
-        let (code, _) = answer(&st, ask("POST", "/admin/folders", &a), Some(json!({ "name": "Ads" }))).await;
+        let (code, _) = answer(&st, ask("POST", "/admin/folders", &a), Some(serde_json::json!({ "name": "Ads" }))).await;
         assert_eq!(code, StatusCode::CREATED);
-        let (code, _) = answer(&st, ask("POST", "/admin/folders", &a), Some(json!({ "name": "Ads" }))).await;
+        let (code, _) = answer(&st, ask("POST", "/admin/folders", &a), Some(serde_json::json!({ "name": "Ads" }))).await;
         assert_eq!(code, StatusCode::CONFLICT);
-        let (code, _) = answer(&st, ask("POST", "/admin/folders", &a), Some(json!({ "name": "  " }))).await;
+        let (code, _) = answer(&st, ask("POST", "/admin/folders", &a), Some(serde_json::json!({ "name": "  " }))).await;
         assert_eq!(code, StatusCode::BAD_REQUEST);
 
         // The same name in her own space is another folder.
         let (code, _) =
-            answer(&st, ask("POST", "/me/folders", &vera), Some(json!({ "name": "Ads", "color": "green" }))).await;
+            answer(&st, ask("POST", "/me/folders", &vera), Some(serde_json::json!({ "name": "Ads", "color": "green" }))).await;
         assert_eq!(code, StatusCode::CREATED);
         let (code, _) =
             answer(&st, ask("PUT", "/me/profiles/p-own", &vera), Some(profile_json("Mine", "Ads", b"x"))).await;
@@ -4693,13 +4788,13 @@ mod tests {
         let (code, f) = answer(
             &st,
             ask("PATCH", "/me/folders/Ads", &vera),
-            Some(json!({ "name": "Mine", "color": "pink" })),
+            Some(serde_json::json!({ "name": "Mine", "color": "pink" })),
         )
         .await;
         assert_eq!(code, StatusCode::OK);
-        assert_eq!(f, json!({ "name": "Mine", "color": "pink", "profiles": 1 }));
+        assert_eq!(f, serde_json::json!({ "name": "Mine", "color": "pink", "profiles": 1 }));
         let (code, _) =
-            answer(&st, ask("PATCH", "/me/folders/Nope", &vera), Some(json!({ "color": "x" }))).await;
+            answer(&st, ask("PATCH", "/me/folders/Nope", &vera), Some(serde_json::json!({ "color": "x" }))).await;
         assert_eq!(code, StatusCode::NOT_FOUND);
 
         // Her rename touched only her own; the team's Ads is as it was.
@@ -4846,7 +4941,7 @@ mod tests {
         let (code, _) = answer(
             &st,
             ask("PATCH", &format!("/admin/members/{vera_id}"), &admin(&st)),
-            Some(json!({ "active": false })),
+            Some(serde_json::json!({ "active": false })),
         )
         .await;
         assert_eq!(code, StatusCode::OK);
@@ -4871,10 +4966,10 @@ mod tests {
             ],
         )
         .await;
-        let (code, _) = answer(&st, ask("POST", "/admin/folders", &a), Some(json!({ "name": "Ads" }))).await;
+        let (code, _) = answer(&st, ask("POST", "/admin/folders", &a), Some(serde_json::json!({ "name": "Ads" }))).await;
         assert_eq!(code, StatusCode::CREATED);
         let (code, _) =
-            answer(&st, ask("PATCH", "/admin/folders/Ads", &a), Some(json!({ "name": "Clients" }))).await;
+            answer(&st, ask("PATCH", "/admin/folders/Ads", &a), Some(serde_json::json!({ "name": "Clients" }))).await;
         assert_eq!(code, StatusCode::OK);
         let g = st.store.grants_of(&sam_id).unwrap();
         assert_eq!(g.len(), 2, "{g:?}");
@@ -4895,7 +4990,7 @@ mod tests {
         let (code, _) = answer(
             &st,
             ask("PUT", &format!("/admin/members/{id}/grants"), &admin(&st)),
-            Some(json!({ "grants": grants })),
+            Some(serde_json::json!({ "grants": grants })),
         )
         .await;
         assert_eq!(code, StatusCode::OK);
@@ -4932,15 +5027,15 @@ mod tests {
         let (_, vera) = member(&st, "Vera", everything()).await;
         let long = "x".repeat(MAX_LABEL + 1);
         for (method, uri, token, body) in [
-            ("PUT", "/profiles/p1", &vera, json!({ "name": long, "data": "" })),
-            ("PUT", "/profiles/p1", &vera, json!({ "name": "n", "folder": long, "data": "" })),
-            ("PUT", "/me/profiles/p2", &vera, json!({ "name": long, "data": "" })),
-            ("PUT", "/proxies/x1", &vera, json!({ "name": long, "kind": "socks5", "data": "" })),
-            ("PUT", "/proxies/x1", &vera, json!({ "name": "n", "kind": long, "data": "" })),
-            ("PUT", "/proxies/x1", &vera, json!({ "name": "n", "kind": "socks5", "country": long, "data": "" })),
-            ("POST", "/me/folders", &vera, json!({ "name": long })),
-            ("POST", "/admin/folders", &a, json!({ "name": long })),
-            ("POST", "/admin/folders", &a, json!({ "name": "Ads", "color": long })),
+            ("PUT", "/profiles/p1", &vera, serde_json::json!({ "name": long, "data": "" })),
+            ("PUT", "/profiles/p1", &vera, serde_json::json!({ "name": "n", "folder": long, "data": "" })),
+            ("PUT", "/me/profiles/p2", &vera, serde_json::json!({ "name": long, "data": "" })),
+            ("PUT", "/proxies/x1", &vera, serde_json::json!({ "name": long, "kind": "socks5", "data": "" })),
+            ("PUT", "/proxies/x1", &vera, serde_json::json!({ "name": "n", "kind": long, "data": "" })),
+            ("PUT", "/proxies/x1", &vera, serde_json::json!({ "name": "n", "kind": "socks5", "country": long, "data": "" })),
+            ("POST", "/me/folders", &vera, serde_json::json!({ "name": long })),
+            ("POST", "/admin/folders", &a, serde_json::json!({ "name": long })),
+            ("POST", "/admin/folders", &a, serde_json::json!({ "name": "Ads", "color": long })),
         ] {
             let (code, _) = answer(&st, ask(method, uri, token), Some(body)).await;
             assert_eq!(code, StatusCode::BAD_REQUEST, "{method} {uri}");
@@ -4952,7 +5047,7 @@ mod tests {
         // Counted in characters, not bytes: a name in Cyrillic gets as many.
         let fits = "й".repeat(MAX_LABEL);
         let (code, _) =
-            answer(&st, ask("PUT", "/profiles/p1", &vera), Some(json!({ "name": fits, "folder": fits, "data": "" })))
+            answer(&st, ask("PUT", "/profiles/p1", &vera), Some(serde_json::json!({ "name": fits, "folder": fits, "data": "" })))
                 .await;
         assert_eq!(code, StatusCode::CREATED);
     }
@@ -4983,7 +5078,7 @@ mod tests {
             answer(&st, ask("PUT", "/me/profiles/p-own", &vera), Some(profile_json("Own", " Mine ", b"x"))).await;
         assert_eq!(code, StatusCode::CREATED);
         let (code, got) =
-            answer(&st, ask("POST", "/me/profiles/p-own/to-team", &vera), Some(json!({ "folder": " Ads " })))
+            answer(&st, ask("POST", "/me/profiles/p-own/to-team", &vera), Some(serde_json::json!({ "folder": " Ads " })))
                 .await;
         assert_eq!((code, got["folder"].as_str()), (StatusCode::OK, Some("Ads")));
 
@@ -4996,19 +5091,19 @@ mod tests {
         let st = state();
         let a = admin(&st);
         let (_, vera) = member(&st, "Vera", vec![allow(Scope::Team, Action::See), allow(Scope::Team, Action::Create)]).await;
-        let (code, _) = answer(&st, ask("POST", "/admin/folders", &a), Some(json!({ "name": "Ads" }))).await;
+        let (code, _) = answer(&st, ask("POST", "/admin/folders", &a), Some(serde_json::json!({ "name": "Ads" }))).await;
         assert_eq!(code, StatusCode::CREATED);
         for bad in [".", "..", " .. "] {
             let refused = |(code, got): (StatusCode, Value)| {
                 assert_eq!((code, got["error"].as_str()), (StatusCode::BAD_REQUEST, Some("a folder cannot be named . or ..")), "{bad:?}");
             };
-            refused(answer(&st, ask("POST", "/admin/folders", &a), Some(json!({ "name": bad }))).await);
-            refused(answer(&st, ask("PATCH", "/admin/folders/Ads", &a), Some(json!({ "name": bad }))).await);
-            refused(answer(&st, ask("POST", "/me/folders", &vera), Some(json!({ "name": bad }))).await);
+            refused(answer(&st, ask("POST", "/admin/folders", &a), Some(serde_json::json!({ "name": bad }))).await);
+            refused(answer(&st, ask("PATCH", "/admin/folders/Ads", &a), Some(serde_json::json!({ "name": bad }))).await);
+            refused(answer(&st, ask("POST", "/me/folders", &vera), Some(serde_json::json!({ "name": bad }))).await);
             refused(answer(&st, ask("PUT", "/profiles/p1", &vera), Some(profile_json("P", bad, b"x"))).await);
         }
         // Dots inside a name are fine: only a whole "." or ".." is a path's.
-        let (code, _) = answer(&st, ask("POST", "/admin/folders", &a), Some(json!({ "name": "..Ads." }))).await;
+        let (code, _) = answer(&st, ask("POST", "/admin/folders", &a), Some(serde_json::json!({ "name": "..Ads." }))).await;
         assert_eq!(code, StatusCode::CREATED);
         let names: Vec<String> = st.store.folders_in(TEAM).unwrap().into_iter().map(|f| f.name).collect();
         assert_eq!(names, ["..Ads.", "Ads"]);
@@ -5104,13 +5199,13 @@ mod tests {
         let (sam_id, sam) = member(&st, "Sam", vec![]).await;
         let (lena_id, lena) = member(&st, "Lena", vec![]).await;
         let key = st.key.public_b64();
-        let team = json!({ "id": "team-under-test", "name": "Team" });
+        let team = serde_json::json!({ "id": "team-under-test", "name": "Team" });
 
         let (code, me) = answer(&st, ask("GET", "/me", &vera), None).await;
         assert_eq!(code, StatusCode::OK);
         assert_eq!(
             me,
-            json!({ "team": team, "member": { "id": vera_id, "name": "Vera" }, "admin": false, "perm_key": key })
+            serde_json::json!({ "team": team, "member": { "id": vera_id, "name": "Vera" }, "admin": false, "perm_key": key })
         );
         // The key is the one every permission checks out with.
         let (_, issued) = answer(&st, ask("GET", "/permission", &vera), None).await;
@@ -5119,12 +5214,12 @@ mod tests {
 
         let (code, me) = answer(&st, ask("GET", "/me", &admin(&st)), None).await;
         assert_eq!(code, StatusCode::OK);
-        assert_eq!(me, json!({ "team": team, "member": null, "admin": true, "perm_key": key }));
+        assert_eq!(me, serde_json::json!({ "team": team, "member": null, "admin": true, "perm_key": key }));
 
         // Switched off and removed answer differently, so the launcher can tell.
         let a = admin(&st);
         let (code, _) =
-            answer(&st, ask("PATCH", &format!("/admin/members/{sam_id}"), &a), Some(json!({ "active": false }))).await;
+            answer(&st, ask("PATCH", &format!("/admin/members/{sam_id}"), &a), Some(serde_json::json!({ "active": false }))).await;
         assert_eq!(code, StatusCode::OK);
         let (code, _) = answer(&st, ask("DELETE", &format!("/admin/members/{lena_id}"), &a), None).await;
         assert_eq!(code, StatusCode::NO_CONTENT);
@@ -5158,21 +5253,21 @@ mod tests {
         let mut sam_live = st.hub.subscribe(&sam_id).await;
         let (mut admin_live, _seat) = listen(&st, &hdr(&a)).await.unwrap();
         let (code, _) =
-            answer(&st, ask("PATCH", &format!("/admin/members/{sam_id}"), &a), Some(json!({ "active": false }))).await;
+            answer(&st, ask("PATCH", &format!("/admin/members/{sam_id}"), &a), Some(serde_json::json!({ "active": false }))).await;
         assert_eq!(code, StatusCode::OK);
         heard(&mut sam_live);
 
-        let (code, _) = answer(&st, ask("PATCH", "/admin/team", &vera), Some(json!({ "name": "Mine" }))).await;
+        let (code, _) = answer(&st, ask("PATCH", "/admin/team", &vera), Some(serde_json::json!({ "name": "Mine" }))).await;
         assert_eq!(code, StatusCode::UNAUTHORIZED);
         for bad in ["   ".to_string(), "x".repeat(MAX_TEAM_NAME + 1)] {
-            let (code, got) = answer(&st, ask("PATCH", "/admin/team", &a), Some(json!({ "name": bad }))).await;
+            let (code, got) = answer(&st, ask("PATCH", "/admin/team", &a), Some(serde_json::json!({ "name": bad }))).await;
             assert_eq!((code, got["code"].as_str()), (StatusCode::BAD_REQUEST, Some("bad_request")));
         }
         assert!(heard(&mut vera_live).is_empty(), "nothing changed yet");
 
-        let (code, got) = answer(&st, ask("PATCH", "/admin/team", &a), Some(json!({ "name": "  Ads crew  " }))).await;
+        let (code, got) = answer(&st, ask("PATCH", "/admin/team", &a), Some(serde_json::json!({ "name": "  Ads crew  " }))).await;
         assert_eq!(code, StatusCode::OK);
-        assert_eq!(got, json!({ "id": "team-under-test", "name": "Ads crew" }));
+        assert_eq!(got, serde_json::json!({ "id": "team-under-test", "name": "Ads crew" }));
         let (_, me) = answer(&st, ask("GET", "/me", &vera), None).await;
         assert_eq!(me["team"]["name"], "Ads crew");
 
@@ -5183,7 +5278,7 @@ mod tests {
 
         // Counted in characters: a Cyrillic name of the full length fits.
         let fits = "й".repeat(MAX_TEAM_NAME);
-        let (code, got) = answer(&st, ask("PATCH", "/admin/team", &a), Some(json!({ "name": fits }))).await;
+        let (code, got) = answer(&st, ask("PATCH", "/admin/team", &a), Some(serde_json::json!({ "name": fits }))).await;
         assert_eq!((code, got["name"].as_str()), (StatusCode::OK, Some(fits.as_str())));
     }
 
@@ -5242,11 +5337,11 @@ mod tests {
         let (_, looker) = member(&st, "Looker", vec![allow(Scope::Team, Action::See)]).await;
         let (off_id, off) = member(&st, "Off", everything()).await;
         let (gone_id, gone) = member(&st, "Gone", everything()).await;
-        answer(&st, ask("PATCH", &format!("/admin/members/{off_id}"), &a), Some(json!({ "active": false }))).await;
+        answer(&st, ask("PATCH", &format!("/admin/members/{off_id}"), &a), Some(serde_json::json!({ "active": false }))).await;
         answer(&st, ask("DELETE", &format!("/admin/members/{gone_id}"), &a), None).await;
         let (code, _) = answer(&st, on(ask("POST", "/profiles/p1/lease", &vera), "mac", "Mac"), None).await;
         assert_eq!(code, StatusCode::OK);
-        let (code, _) = answer(&st, ask("POST", "/admin/folders", &a), Some(json!({ "name": "Shops" }))).await;
+        let (code, _) = answer(&st, ask("POST", "/admin/folders", &a), Some(serde_json::json!({ "name": "Shops" }))).await;
         assert_eq!(code, StatusCode::CREATED);
 
         let cases = [
@@ -5259,7 +5354,7 @@ mod tests {
             (ask("GET", "/profiles/p-nope", &vera), None, StatusCode::NOT_FOUND, "not_found"),
             (ask("PUT", "/profiles/p1", &vera), Some(based_on(profile_json("x", "Ads", b"x"), 1)), StatusCode::CONFLICT, "leased"),
             (ask("POST", "/profiles/p1/lease", &vera), None, StatusCode::BAD_REQUEST, "bad_request"),
-            (ask("POST", "/admin/folders", &a), Some(json!({ "name": "Shops" })), StatusCode::CONFLICT, "conflict"),
+            (ask("POST", "/admin/folders", &a), Some(serde_json::json!({ "name": "Shops" })), StatusCode::CONFLICT, "conflict"),
             (ask("DELETE", "/admin/folders/Ads", &a), None, StatusCode::CONFLICT, "conflict"),
         ];
         for (b, body, want, want_code) in cases {
@@ -5443,7 +5538,7 @@ mod tests {
         let (code, _) = answer(&st, ask("DELETE", "/profiles/p1", &a), None).await;
         assert_eq!(code, StatusCode::NO_CONTENT);
         let (code, _) =
-            answer(&st, ask("PATCH", "/admin/folders/Ads", &a), Some(json!({ "name": "Clients" }))).await;
+            answer(&st, ask("PATCH", "/admin/folders/Ads", &a), Some(serde_json::json!({ "name": "Clients" }))).await;
         assert_eq!(code, StatusCode::OK);
 
         let (_, list) = answer(&st, ask("GET", "/trash", &deleter), None).await;
@@ -5561,7 +5656,7 @@ mod tests {
         assert_eq!(code, StatusCode::OK);
         heard(&mut ads_live);
         let (code, _) =
-            answer(&st, ask("PATCH", &format!("/admin/members/{vera_id}"), &a), Some(json!({ "active": false }))).await;
+            answer(&st, ask("PATCH", &format!("/admin/members/{vera_id}"), &a), Some(serde_json::json!({ "active": false }))).await;
         assert_eq!(code, StatusCode::OK);
         assert_eq!(heard(&mut ads_live), vec![lease()]);
         assert!(heard(&mut sam_live).is_empty(), "Sam may not see it");
@@ -5634,7 +5729,7 @@ mod tests {
         let a = admin(&st);
         st.store.put_proxy("x1", "DC", "socks5", "JP", b"user:pass@dc", "setup").unwrap();
         let mut body = profile_json("Shop", "Ads", b"settings");
-        body["card"] = json!({ "proxy_id": "x1" });
+        body["card"] = serde_json::json!({ "proxy_id": "x1" });
         assert_eq!(answer(&st, ask("PUT", "/profiles/p1", &a), Some(body)).await.0, StatusCode::CREATED);
         // Start in Ads, and nothing at all on the proxy.
         let ads = |x| allow(folder("Ads"), x);
@@ -5693,7 +5788,7 @@ mod tests {
         assert_eq!(code, StatusCode::CREATED);
         for (id, proxy) in [("own", "x-own"), ("own2", "x1")] {
             let mut own = profile_json("Mine", "", b"s");
-            own["card"] = json!({ "proxy_id": proxy });
+            own["card"] = serde_json::json!({ "proxy_id": proxy });
             let (code, _) = answer(&st, ask("PUT", &format!("/me/profiles/{id}"), &looker), Some(own)).await;
             assert_eq!(code, if id == "own" { StatusCode::CREATED } else { StatusCode::BAD_REQUEST }, "{id}");
         }
@@ -5752,7 +5847,7 @@ mod tests {
         assert_eq!(code, StatusCode::CONFLICT);
         assert_eq!(
             json_of(&raw),
-            json!({ "error": "changed since you read it", "code": "stale", "current_session_rev": 1 })
+            serde_json::json!({ "error": "changed since you read it", "code": "stale", "current_session_rev": 1 })
         );
         let (code, _, _) = bytes_answer(&st, mac(ask("PUT", &put("?base_session_rev=1"), &vera)), jar.clone()).await;
         assert_eq!(code, StatusCode::OK);
@@ -5873,7 +5968,7 @@ mod tests {
         assert_eq!(answer(&st, on(ask("POST", "/profiles/p1/lease", &off), "mac", "Mac"), None).await.0, StatusCode::OK);
         let h = with_device(&off);
         let c = require_member(&st, &h).unwrap();
-        answer(&st, ask("PATCH", &format!("/admin/members/{off_id}"), &a), Some(json!({ "active": false }))).await;
+        answer(&st, ask("PATCH", &format!("/admin/members/{off_id}"), &a), Some(serde_json::json!({ "active": false }))).await;
         st.store.lease_acquire("p1", &off_id, "mac", "Mac", 90).unwrap().unwrap();
         let e = write_session(&st, &c, TEAM, "p1".into(), base(), &h, Body::from("jar")).await.unwrap_err();
         assert_eq!((e.status, e.code), (StatusCode::FORBIDDEN, code::SWITCHED_OFF));
@@ -5914,7 +6009,7 @@ mod tests {
             [Action::See, Action::Start, Action::Edit, Action::Create].iter().map(|x| allow(folder("Ads"), *x)).collect();
         let (_, vera) = member(&st, "Vera", ads).await;
         let (_, sam) = member(&st, "Sam", vec![allow(folder("Shops"), Action::See)]).await;
-        let card = json!({ "proxy_id": "x1", "color": "#c33", "notes": "warm up first", "tags": ["fb", "ads"] });
+        let card = serde_json::json!({ "proxy_id": "x1", "color": "#c33", "notes": "warm up first", "tags": ["fb", "ads"] });
         let with_card = |c: Value, rev: Option<u64>| {
             let mut b = profile_json("Shop", "Ads", b"s");
             b["card"] = c;
@@ -5931,7 +6026,7 @@ mod tests {
         // Nobody binds a proxy that is not there, or one from somebody's own space.
         assert_eq!(answer(&st, ask("PUT", "/me/proxies/x-own", &a), Some(proxy_json("Home"))).await.0, StatusCode::CREATED);
         for x in ["x-nope", "x-own"] {
-            let (code, _) = answer(&st, ask("PUT", "/profiles/p1", &a), Some(with_card(json!({ "proxy_id": x }), Some(1)))).await;
+            let (code, _) = answer(&st, ask("PUT", "/profiles/p1", &a), Some(with_card(serde_json::json!({ "proxy_id": x }), Some(1)))).await;
             assert_eq!(code, StatusCode::BAD_REQUEST, "{x}");
         }
         // Keeping the binding asks nothing of her; no card at all keeps it.
@@ -5956,24 +6051,24 @@ mod tests {
 
         // The limits, in characters, before anything is written.
         let bad = [
-            json!({ "notes": "n".repeat(2001) }),
-            json!({ "color": "c".repeat(33) }),
-            json!({ "tags": vec!["t"; 51] }),
-            json!({ "tags": ["t".repeat(65)] }),
-            json!({ "proxy_id": "x".repeat(129) }),
+            serde_json::json!({ "notes": "n".repeat(2001) }),
+            serde_json::json!({ "color": "c".repeat(33) }),
+            serde_json::json!({ "tags": vec!["t"; 51] }),
+            serde_json::json!({ "tags": ["t".repeat(65)] }),
+            serde_json::json!({ "proxy_id": "x".repeat(129) }),
         ];
         for c in bad {
             let (code, got) = answer(&st, mac(ask("PUT", "/profiles/p1", &vera)), Some(with_card(c.clone(), Some(3)))).await;
             assert_eq!((code, got["code"].as_str()), (StatusCode::BAD_REQUEST, Some("bad_request")), "{c}");
         }
-        let full = json!({ "proxy_id": "x1", "notes": "н".repeat(2000), "color": "c".repeat(32), "tags": vec!["т".repeat(64); 50] });
+        let full = serde_json::json!({ "proxy_id": "x1", "notes": "н".repeat(2000), "color": "c".repeat(32), "tags": vec!["т".repeat(64); 50] });
         let (code, _) = answer(&st, mac(ask("PUT", "/profiles/p1", &vera)), Some(with_card(full, Some(3)))).await;
         assert_eq!(code, StatusCode::OK, "right at the limits");
         // A blank binding is none.
-        let (code, _) = answer(&st, mac(ask("PUT", "/profiles/p1", &vera)), Some(with_card(json!({ "proxy_id": " " }), Some(4)))).await;
+        let (code, _) = answer(&st, mac(ask("PUT", "/profiles/p1", &vera)), Some(with_card(serde_json::json!({ "proxy_id": " " }), Some(4)))).await;
         assert_eq!(code, StatusCode::OK);
         let (_, one) = answer(&st, ask("GET", "/profiles/p1", &vera), None).await;
-        assert_eq!(one["card"], json!({ "proxy_id": null, "color": "", "notes": "", "tags": [] }));
+        assert_eq!(one["card"], serde_json::json!({ "proxy_id": null, "color": "", "notes": "", "tags": [] }));
     }
 
     #[tokio::test]
@@ -5988,7 +6083,7 @@ mod tests {
         for kind in ITEM_KINDS {
             let uri = format!("/items/{kind}/i1");
             let list = format!("/items/{kind}");
-            let body = json!({ "name": format!("A {kind}"), "data": STANDARD.encode(format!("{kind} data")) });
+            let body = serde_json::json!({ "name": format!("A {kind}"), "data": STANDARD.encode(format!("{kind} data")) });
             heard(&mut looker_live);
 
             // A folder's rights do not reach what is in no folder; seeing is not making.
@@ -6054,7 +6149,7 @@ mod tests {
         }
         assert_eq!(answer(&st, ask("DELETE", "/trash/i1?kind=note", &vera), None).await.0, StatusCode::NOT_FOUND);
         let long = format!("/items/tag/{}", "i".repeat(129));
-        let (code, _) = answer(&st, ask("PUT", &long, &vera), Some(json!({ "data": "" }))).await;
+        let (code, _) = answer(&st, ask("PUT", &long, &vera), Some(serde_json::json!({ "data": "" }))).await;
         assert_eq!(code, StatusCode::BAD_REQUEST);
     }
 
@@ -6064,7 +6159,7 @@ mod tests {
         let (vera_id, vera) = member(&st, "Vera", vec![]).await;
         let (_, sam) = member(&st, "Sam", everything()).await;
         let mut vera_live = st.hub.subscribe(&vera_id).await;
-        let body = json!({ "name": "Mine", "data": STANDARD.encode(b"own") });
+        let body = serde_json::json!({ "name": "Mine", "data": STANDARD.encode(b"own") });
 
         // No grants asked in my own space.
         assert_eq!(answer(&st, ask("PUT", "/me/items/tag/t1", &vera), Some(body.clone())).await.0, StatusCode::CREATED);
@@ -6073,7 +6168,7 @@ mod tests {
         assert_eq!(answer(&st, ask("GET", "/me/items/tag/t1", &sam), None).await.0, StatusCode::NOT_FOUND);
         assert_eq!(answer(&st, ask("GET", "/items/tag", &sam), None).await.1, json!([]));
         // The team may hold the same id: one per kind per space.
-        assert_eq!(answer(&st, ask("PUT", "/items/tag/t1", &sam), Some(json!({ "data": "" }))).await.0, StatusCode::CREATED);
+        assert_eq!(answer(&st, ask("PUT", "/items/tag/t1", &sam), Some(serde_json::json!({ "data": "" }))).await.0, StatusCode::CREATED);
         let (_, mine) = answer(&st, ask("GET", "/me/items/tag", &vera), None).await;
         assert_eq!((mine.as_array().unwrap().len(), mine[0]["name"].clone()), (1, json!("Mine")));
 
@@ -6138,7 +6233,7 @@ mod tests {
         let st = state();
         let (_, vera) = member(&st, "Vera", vec![]).await;
         let (_, sam) = member(&st, "Sam", everything()).await;
-        let doc = json!({ "name": "sync", "data": STANDARD.encode(br#"{"generation":"g1"}"#) });
+        let doc = serde_json::json!({ "name": "sync", "data": STANDARD.encode(br#"{"generation":"g1"}"#) });
         assert_eq!(answer(&st, ask("PUT", "/me/items/sync/space", &vera), Some(doc.clone())).await.0, StatusCode::CREATED);
         let (code, got) = answer(&st, ask("GET", "/me/items/sync/space", &vera), None).await;
         assert_eq!((code, got["revision"].as_u64()), (StatusCode::OK, Some(1)));
@@ -6162,7 +6257,7 @@ mod tests {
         let (looker_id, looker) = member(&st, "Looker", vec![see]).await;
         let (_, nobody) = member(&st, "Nobody", vec![]).await;
         let mut looker_live = st.hub.subscribe(&looker_id).await;
-        let ext = json!({ "name": "uBlock", "data": STANDARD.encode(br#"{"version":"1.0"}"#) });
+        let ext = serde_json::json!({ "name": "uBlock", "data": STANDARD.encode(br#"{"version":"1.0"}"#) });
         assert_eq!(answer(&st, ask("PUT", "/items/extension/e1", &maker), Some(ext.clone())).await.0, StatusCode::CREATED);
         assert_eq!(answer(&st, ask("PUT", "/items/bookmark/b1", &maker), Some(ext)).await.0, StatusCode::CREATED);
         let pkg = |q: &str| format!("/items/extension/e1/package{q}");
@@ -6179,7 +6274,7 @@ mod tests {
         }
         let (code, _, raw) = bytes_answer(&st, ask("PUT", &pkg("?base_package_rev=0"), &editor), zip2.clone()).await;
         assert_eq!(code, StatusCode::CONFLICT);
-        assert_eq!(json_of(&raw), json!({ "error": "changed since you read it", "code": "stale", "current_package_rev": 1 }));
+        assert_eq!(json_of(&raw), serde_json::json!({ "error": "changed since you read it", "code": "stale", "current_package_rev": 1 }));
         let (code, _, raw) = bytes_answer(&st, ask("PUT", &pkg("?base_package_rev=1"), &editor), zip2.clone()).await;
         assert_eq!((code, json_of(&raw)["updated_by"].clone()), (StatusCode::OK, json!(editor_id)));
         assert_eq!(heard(&mut looker_live), vec![Event::TeamChanged { what: "package", id: "e1".into() }]);
@@ -6206,7 +6301,7 @@ mod tests {
         assert_eq!((code, code_of(&raw)), (StatusCode::PAYLOAD_TOO_LARGE, "too_large".into()));
 
         // Mine too, and no one else's to read.
-        let own = json!({ "name": "Own", "data": "" });
+        let own = serde_json::json!({ "name": "Own", "data": "" });
         assert_eq!(answer(&st, ask("PUT", "/me/items/extension/e1", &nobody), Some(own)).await.0, StatusCode::CREATED);
         let (code, _, _) = bytes_answer(&st, ask("PUT", "/me/items/extension/e1/package", &nobody), b"own zip".to_vec()).await;
         assert_eq!(code, StatusCode::OK);
@@ -6228,13 +6323,13 @@ mod tests {
         for (id, f) in [("p1", "Ads"), ("p2", "Other")] {
             assert_eq!(answer(&st, ask("PUT", &format!("/profiles/{id}"), &a), Some(profile_json(id, f, settings))).await.0, StatusCode::CREATED);
         }
-        let item = |data: Value| json!({ "name": "x", "data": STANDARD.encode(data.to_string()) });
+        let item = |data: Value| serde_json::json!({ "name": "x", "data": STANDARD.encode(data.to_string()) });
         for (id, f) in [("b-ads", "Ads"), ("b-other", "Other"), ("b-all", "")] {
-            let b = item(json!({ "id": id, "title": id, "url": "https://example.com/", "folder": f }));
+            let b = item(serde_json::json!({ "id": id, "title": id, "url": "https://example.com/", "folder": f }));
             assert_eq!(answer(&st, ask("PUT", &format!("/items/bookmark/{id}"), &a), Some(b)).await.0, StatusCode::CREATED);
         }
         for id in ["e1", "e2"] {
-            assert_eq!(answer(&st, ask("PUT", &format!("/items/extension/{id}"), &a), Some(item(json!({})))).await.0, StatusCode::CREATED);
+            assert_eq!(answer(&st, ask("PUT", &format!("/items/extension/{id}"), &a), Some(item(serde_json::json!({})))).await.0, StatusCode::CREATED);
             let uri = format!("/items/extension/{id}/package");
             assert_eq!(bytes_answer(&st, ask("PUT", &uri, &a), id.as_bytes().to_vec()).await.0, StatusCode::OK);
         }
@@ -6269,7 +6364,7 @@ mod tests {
         let (_, vera) = member(&st, "Vera", vec![allow(Scope::Team, Action::See), ads(Action::Create), ads(Action::Start)]).await;
         assert_eq!(answer(&st, ask("GET", "/proxies/x1", &vera), None).await.0, StatusCode::FORBIDDEN);
         let mut body = profile_json("Shop", "Ads", b"s");
-        body["card"] = json!({ "proxy_id": "x1" });
+        body["card"] = serde_json::json!({ "proxy_id": "x1" });
         let (code, got) = answer(&st, ask("PUT", "/profiles/pz", &vera), Some(body.clone())).await;
         assert_eq!((code, got["code"].as_str()), (StatusCode::BAD_REQUEST, Some("bad_proxy")));
         // One who may start through it binds it.
@@ -6279,13 +6374,13 @@ mod tests {
 
         // Out of the team and back into a folder with Start does not hand the login over either.
         let mut bound = profile_json("Bound", "Ads", b"s");
-        bound["card"] = json!({ "proxy_id": "x1" });
+        bound["card"] = serde_json::json!({ "proxy_id": "x1" });
         assert_eq!(answer(&st, ask("PUT", "/profiles/p1", &a), Some(bound)).await.0, StatusCode::CREATED);
         let bobs = |x| allow(folder("Bob"), x);
         let bob_rights = vec![ads(Action::See), ads(Action::TakeOut), bobs(Action::See), bobs(Action::Create), bobs(Action::Start)];
         let (bob_id, bob) = member(&st, "Bob", bob_rights).await;
         assert_eq!(answer(&st, ask("POST", "/profiles/p1/to-me", &bob), None).await.0, StatusCode::OK);
-        let (code, got) = answer(&st, ask("POST", "/me/profiles/p1/to-team", &bob), Some(json!({ "folder": "Bob" }))).await;
+        let (code, got) = answer(&st, ask("POST", "/me/profiles/p1/to-team", &bob), Some(serde_json::json!({ "folder": "Bob" }))).await;
         assert_eq!((code, got["code"].as_str()), (StatusCode::BAD_REQUEST, Some("bad_proxy")));
         assert_eq!(st.store.profile_meta("p1").unwrap().unwrap().1, personal_space(&bob_id));
     }
@@ -6313,7 +6408,7 @@ mod tests {
             assert_eq!((code, got["code"].as_str()), (StatusCode::CONFLICT, Some("conflict")), "{f}");
         }
         st.store.create_folder(TEAM, "Open", "").unwrap();
-        let (code, _) = answer(&st, ask("PATCH", "/admin/folders/Open", &a), Some(json!({ "name": "Secret" }))).await;
+        let (code, _) = answer(&st, ask("PATCH", "/admin/folders/Open", &a), Some(serde_json::json!({ "name": "Secret" }))).await;
         assert_eq!(code, StatusCode::CONFLICT);
         let (_, trash) = answer(&st, ask("GET", "/trash", &mallory), None).await;
         assert!(trash.as_array().unwrap().iter().all(|t| t["id"] != "p-sec"), "{trash}");
@@ -6331,7 +6426,7 @@ mod tests {
     async fn the_first_package_on_create_alone_is_for_the_one_who_made_the_extension() {
         let st = state();
         let a = admin(&st);
-        let ext = json!({ "name": "uBlock", "data": "" });
+        let ext = serde_json::json!({ "name": "uBlock", "data": "" });
         assert_eq!(answer(&st, ask("PUT", "/items/extension/e1", &a), Some(ext.clone())).await.0, StatusCode::CREATED);
         let (_, bob) = member(&st, "Bob", vec![allow(Scope::Team, Action::See), allow(Scope::Team, Action::Create)]).await;
         let (code, _) = answer(&st, ask("PUT", "/items/extension/e1", &bob), Some(based_on(ext.clone(), 1))).await;
@@ -6352,7 +6447,7 @@ mod tests {
         st.store.put_proxy("x9", "Old", "socks5", "JP", b"old-host", "setup").unwrap();
         for (id, x) in [("p1", "x1"), ("p2", "x9")] {
             let mut bound = profile_json("Shop", "Ads", b"s");
-            bound["card"] = json!({ "proxy_id": x });
+            bound["card"] = serde_json::json!({ "proxy_id": x });
             assert_eq!(answer(&st, ask("PUT", &format!("/profiles/{id}"), &a), Some(bound)).await.0, StatusCode::CREATED);
         }
         let team = |x| allow(Scope::Team, x);
@@ -6391,7 +6486,7 @@ mod tests {
         st.store.put_proxy("x1", "DC", "socks5", "JP", b"login", "setup").unwrap();
         let (_, vera) = member(&st, "Vera", everything()).await;
         let (_, maker) = member(&st, "Maker", vec![allow(Scope::Team, Action::Create)]).await;
-        let tag = json!({ "name": "VIP", "data": "" });
+        let tag = serde_json::json!({ "name": "VIP", "data": "" });
         assert_eq!(answer(&st, ask("PUT", "/items/tag/vip", &vera), Some(tag.clone())).await.0, StatusCode::CREATED);
         assert_eq!(answer(&st, ask("PUT", "/profiles/p1", &vera), Some(profile_json("Shop", "Ads", b"s"))).await.0, StatusCode::CREATED);
         for uri in ["/items/tag/vip", "/profiles/p1", "/proxies/x1"] {
@@ -6421,14 +6516,14 @@ mod tests {
         let (code, got) = answer(&st, ask("PUT", "/me/profiles/own", &vera), Some(based_on(own(b"queued"), 2))).await;
         assert_eq!((code, got["code"].as_str(), got["current_revision"].as_u64()), (StatusCode::CONFLICT, Some("stale"), Some(0)));
         assert!(st.store.profile_meta("own").unwrap().is_none(), "not brought back");
-        let (code, got) = answer(&st, ask("PUT", "/me/items/bookmark/b1", &vera), Some(based_on(json!({ "data": "" }), 7))).await;
+        let (code, got) = answer(&st, ask("PUT", "/me/items/bookmark/b1", &vera), Some(based_on(serde_json::json!({ "data": "" }), 7))).await;
         assert_eq!((code, got["current_revision"].as_u64()), (StatusCode::CONFLICT, Some(0)));
         let (code, _) = answer(&st, ask("PUT", "/me/proxies/x1", &vera), Some(based_on(proxy_json("Home"), 3))).await;
         assert_eq!(code, StatusCode::CONFLICT);
         // Zero is "new": made while free, stale once there.
-        let (code, _) = answer(&st, ask("PUT", "/me/items/bookmark/b1", &vera), Some(based_on(json!({ "data": "" }), 0))).await;
+        let (code, _) = answer(&st, ask("PUT", "/me/items/bookmark/b1", &vera), Some(based_on(serde_json::json!({ "data": "" }), 0))).await;
         assert_eq!(code, StatusCode::CREATED);
-        let (code, got) = answer(&st, ask("PUT", "/me/items/bookmark/b1", &vera), Some(based_on(json!({ "data": "" }), 0))).await;
+        let (code, got) = answer(&st, ask("PUT", "/me/items/bookmark/b1", &vera), Some(based_on(serde_json::json!({ "data": "" }), 0))).await;
         assert_eq!((code, got["current_revision"].as_u64()), (StatusCode::CONFLICT, Some(1)));
     }
 
@@ -6440,26 +6535,26 @@ mod tests {
         let (vera_id, vera) = member(&st, "Vera", vera_rights).await;
         assert_eq!(answer(&st, ask("PUT", "/me/proxies/x-own", &vera), Some(proxy_json("Home"))).await.0, StatusCode::CREATED);
         let mut own = profile_json("Mine", "", b"s");
-        own["card"] = json!({ "proxy_id": "x-own" });
+        own["card"] = serde_json::json!({ "proxy_id": "x-own" });
         assert_eq!(answer(&st, ask("PUT", "/me/profiles/p1", &vera), Some(own)).await.0, StatusCode::CREATED);
 
         // Her proxy is not the team's, and she may not bring it: the profile stays hers.
-        let (code, got) = answer(&st, ask("POST", "/me/profiles/p1/to-team", &vera), Some(json!({ "folder": "Ads" }))).await;
+        let (code, got) = answer(&st, ask("POST", "/me/profiles/p1/to-team", &vera), Some(serde_json::json!({ "folder": "Ads" }))).await;
         assert_eq!((code, got["code"].as_str()), (StatusCode::BAD_REQUEST, Some("bad_proxy")));
         assert_eq!(st.store.profile_meta("p1").unwrap().unwrap().1, personal_space(&vera_id));
         assert_eq!(answer(&st, ask("POST", "/me/proxies/x-own/to-team", &vera), None).await.0, StatusCode::FORBIDDEN);
         // Unbound, it goes.
         let mut unbound = based_on(profile_json("Mine", "", b"s"), 1);
-        unbound["card"] = json!({ "proxy_id": null });
+        unbound["card"] = serde_json::json!({ "proxy_id": null });
         assert_eq!(answer(&st, ask("PUT", "/me/profiles/p1", &vera), Some(unbound)).await.0, StatusCode::OK);
-        let (code, _) = answer(&st, ask("POST", "/me/profiles/p1/to-team", &vera), Some(json!({ "folder": "Ads" }))).await;
+        let (code, _) = answer(&st, ask("POST", "/me/profiles/p1/to-team", &vera), Some(serde_json::json!({ "folder": "Ads" }))).await;
         assert_eq!(code, StatusCode::OK);
 
         // With its proxy moved in first, by one who may, the binding goes along.
         let (_, lena) = member(&st, "Lena", vec![team(Action::See), team(Action::Start), team(Action::Create)]).await;
         assert_eq!(answer(&st, ask("PUT", "/me/proxies/x-l", &lena), Some(proxy_json("Lena's"))).await.0, StatusCode::CREATED);
         let mut hers = profile_json("Hers", "", b"s");
-        hers["card"] = json!({ "proxy_id": "x-l" });
+        hers["card"] = serde_json::json!({ "proxy_id": "x-l" });
         assert_eq!(answer(&st, ask("PUT", "/me/profiles/p-l", &lena), Some(hers)).await.0, StatusCode::CREATED);
         assert_eq!(answer(&st, ask("POST", "/me/proxies/x-l/to-team", &lena), None).await.0, StatusCode::OK);
         assert_eq!(answer(&st, ask("POST", "/me/profiles/p-l/to-team", &lena), None).await.0, StatusCode::OK);
@@ -6472,7 +6567,7 @@ mod tests {
         let st = state();
         let (_, vera) = member(&st, "Vera", vec![]).await;
         assert_eq!((PACKAGE_MAX, MAX_BODY, BLOB_MAX), (64 << 20, 16 << 20, 256 << 20));
-        assert_eq!(answer(&st, ask("PUT", "/me/items/extension/e1", &vera), Some(json!({ "data": "" }))).await.0, StatusCode::CREATED);
+        assert_eq!(answer(&st, ask("PUT", "/me/items/extension/e1", &vera), Some(serde_json::json!({ "data": "" }))).await.0, StatusCode::CREATED);
         let pkg = "/me/items/extension/e1/package";
         // Declared past it: refused before a byte is read.
         let b = ask("PUT", pkg, &vera).header(CONTENT_LENGTH, (PACKAGE_MAX + 1).to_string());
@@ -6876,7 +6971,7 @@ mod tests {
 
         // A folder Vera's rules already name comes to be, and Sam sees every
         // folder; Hid's rules name it but hide it.
-        step("POST", "/admin/folders", Some(json!({ "name": "New" }))).await;
+        step("POST", "/admin/folders", Some(serde_json::json!({ "name": "New" }))).await;
         assert_eq!(told(&mut watchers), ["vera", "sam"]);
         let (_, p) = answer(&st, ask("GET", "/permission", &hid_token), None).await;
         let p = verify_permission(&st.key.public_b64(), p["permission"].as_str().unwrap()).unwrap();
@@ -6913,7 +7008,7 @@ mod tests {
 
         // Renamed and deleted: Vera's permission names it and Sam sees it;
         // Hid's rule moves with it, but it was hidden from her throughout.
-        step("PATCH", "/admin/folders/New", Some(json!({ "name": "Newer" }))).await;
+        step("PATCH", "/admin/folders/New", Some(serde_json::json!({ "name": "Newer" }))).await;
         assert_eq!(told(&mut watchers), ["vera", "sam"]);
         assert!(st.store.grants_of(&hid).unwrap().contains(&Grant { scope: folder("Newer"), action: Action::See, allow: false }));
         step("DELETE", "/admin/folders/Newer", None).await;
@@ -6948,7 +7043,7 @@ mod tests {
         let at = seen(&answer(&st, ask("GET", "/admin/members", &a), None).await.1).as_u64().expect("seen");
         assert!((before..=auth::unix_now()).contains(&at), "{at}");
         // Switching her off answers her row as it now stands.
-        let (code, row) = answer(&st, ask("PATCH", &format!("/admin/members/{vera_id}"), &a), Some(json!({ "active": false }))).await;
+        let (code, row) = answer(&st, ask("PATCH", &format!("/admin/members/{vera_id}"), &a), Some(serde_json::json!({ "active": false }))).await;
         assert_eq!(code, StatusCode::OK);
         assert_eq!((row["id"].as_str(), row["active"].as_bool(), row["last_seen_at"].as_u64()), (Some(vera_id.as_str()), Some(false), Some(at)));
         assert!(row["epoch"].as_u64().unwrap() > 1 && row["name"] == "Vera", "{row}");
@@ -6973,7 +7068,7 @@ mod tests {
 
         let (code, got) = answer(&st, ask("GET", &uri, &a), None).await;
         assert_eq!((code, &got), (StatusCode::OK, &want));
-        assert_eq!(got[0], json!({ "scope": { "kind": "team" }, "action": "see", "allow": true }));
+        assert_eq!(got[0], serde_json::json!({ "scope": { "kind": "team" }, "action": "see", "allow": true }));
         let (_, rows) = answer(&st, ask("GET", "/admin/members", &a), None).await;
         assert_eq!((&row_of(&rows, &vera_id)["grants"], &row_of(&rows, &sam_id)["grants"]), (&want, &json!([])));
 
@@ -6984,9 +7079,9 @@ mod tests {
         }
 
         // A rewrite answers the table as kept: one rule once, a refusal over an allow.
-        let see = |allow: bool| json!({ "scope": { "kind": "team" }, "action": "see", "allow": allow });
-        let start = json!({ "scope": { "kind": "team" }, "action": "start", "allow": true });
-        let body = json!({ "grants": [start, see(true), see(false), start] });
+        let see = |allow: bool| serde_json::json!({ "scope": { "kind": "team" }, "action": "see", "allow": allow });
+        let start = serde_json::json!({ "scope": { "kind": "team" }, "action": "start", "allow": true });
+        let body = serde_json::json!({ "grants": [start, see(true), see(false), start] });
         let (code, ack) = answer(&st, ask("PUT", &uri, &a), Some(body)).await;
         assert_eq!(code, StatusCode::OK);
         assert_eq!((ack["id"].as_str(), &ack["grants"]), (Some(vera_id.as_str()), &json!([see(false), start])));

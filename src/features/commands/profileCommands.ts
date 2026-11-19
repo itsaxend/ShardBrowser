@@ -77,6 +77,7 @@ const lacks = (right: ProfileRight) => (s: Subject) => noneMay(metas(s), (p, man
 const createRefusal = () => createAnywhereRefusal(folderNamesOf(data().profiles, data().folderRegistry));
 /** Only rows of the personal space: a team's cookies and pins are not offered yet (perm.rs, space/mod.rs). */
 const personalRows = (s: Subject) => metas(s).every((p) => !isTeamRow(p));
+const cookieRows = (s: Subject) => metas(s).every((p) => !isTeamRow(p) || !!p.rights?.cookies);
 /** Why none of them may: each is protected by a password (#127). */
 const allLocked = (s: Subject) => noneMay(metas(s), lockedRefusal);
 /** One row, protected; a password's own commands. */
@@ -427,7 +428,7 @@ export const PROFILE_COMMANDS: readonly Command[] = [
     ...LIST, id: "profile.exportCookies", scope: "active", group: "copy", icon: UploadIcon,
     label: () => t("commands.exportCookies"),
     surfaces: ["rowMenu", "paletteActions", "peekMenu"],
-    when: personalRows,
+    when: cookieRows,
     disabled: allLocked,
     run: async (s) => { const p = metas(s)[0]; if (p) await data().exportCookies(p); },
   },
@@ -435,7 +436,7 @@ export const PROFILE_COMMANDS: readonly Command[] = [
     ...LIST, id: "profile.importCookies", scope: "active", group: "copy", icon: DownloadIcon,
     label: () => t("commands.importCookies"),
     surfaces: ["rowMenu", "paletteActions", "peekMenu"],
-    when: personalRows,
+    when: cookieRows,
     // A running browser holds its cookie store: the item says so before the
     // click (Pair 18 review, M6), rather than a toast after it.
     disabled: (s) => allLocked(s) ?? stopFirst(s),

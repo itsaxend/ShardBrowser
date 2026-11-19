@@ -1055,7 +1055,7 @@ export const useProfile = create<ProfileStore>((set, get) => ({
     const [id] = await realIds([given.id]);
     if (!id) return;
     const p = get().profiles.find((x) => x.id === id) ?? given;
-    const refused = isTeamRow(p) ? t("errors.teamNotYet") : lockedRefusal(p);
+    const refused = lockedRefusal(p);
     if (refused) { toast.fail({ title: t("useProfile.cookiesExportFailed", { name: p.name }), detail: refused, subject: p.name }); return; }
     try {
       const path = await saveDialog({
@@ -1076,7 +1076,7 @@ export const useProfile = create<ProfileStore>((set, get) => ({
   importCookies: async (given) => {
     const [id] = await realIds([given.id]);
     if (!id) return;
-    const refused = isTeamRow(given) ? t("errors.teamNotYet") : lockedRefusal(given);
+    const refused = lockedRefusal(given);
     if (refused) { toast.fail({ title: t("useProfile.cookiesImportFailed", { name: given.name }), detail: refused, subject: given.name }); return; }
     if (get().running[id]) { toast.err(t("useProfile.stopBeforeCookieImport")); return; }
     try {
