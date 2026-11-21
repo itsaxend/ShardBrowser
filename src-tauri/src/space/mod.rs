@@ -668,7 +668,11 @@ pub mod profile {
         // are only readable/writable then. Refuse cleanly when it is not open.
         if let Some(team) = crate::team::active_team() {
             let safe = super::open::safe(&team);
-            let p = crate::store::data_root()?.join("team-open").join(safe).join(id);
+            // The browser's real user-data-dir is team-open/<team>/<id>/udd
+            // (Session::udd() returns work.join("udd") when own is None, which is
+            // always the case for team profiles). Cookies live there, not in the
+            // work dir itself.
+            let p = crate::store::data_root()?.join("team-open").join(safe).join(id).join("udd");
             if !p.exists() {
                 anyhow::bail!("team profile is not open here: start it first");
             }

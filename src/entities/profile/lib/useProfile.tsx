@@ -1058,6 +1058,7 @@ export const useProfile = create<ProfileStore>((set, get) => ({
     const p = get().profiles.find((x) => x.id === id) ?? given;
     const refused = lockedRefusal(p);
     if (refused) { toast.fail({ title: t("useProfile.cookiesExportFailed", { name: p.name }), detail: refused, subject: p.name }); return; }
+    if (get().running[id]) { toast.err(t("useProfile.stopBeforeCookieExport")); return; }
     try {
       const path = await saveDialog({
         defaultPath: `${(p.name || p.id).replace(/[^\w.-]+/g, "_")}-cookies.json`,

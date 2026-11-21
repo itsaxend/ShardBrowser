@@ -711,15 +711,10 @@ async fn stop_profile(Path(id): Path<String>) -> ApiResult {
 }
 
 async fn export_cookies(Path(id): Path<String>) -> ApiResult {
+    if crate::is_profile_running(&id) {
+        return Err(err(StatusCode::CONFLICT, "stop the profile before exporting cookies"));
+    }
     if let Some(team) = crate::team::active_team() {
-        if crate::is_profile_running(&id) {
-            let pass = crate::space::open::cookie_pass(&team, &id)
-                .await
-                .map_err(fail(StatusCode::FORBIDDEN))?;
-            let cookies = crate::space::cookies::export(&pass)
-                .map_err(fail(StatusCode::INTERNAL_SERVER_ERROR))?;
-            return Ok(Json(json!({ "cookies": cookies })));
-        }
         let (blob, _) = crate::space::open::cookies_fetch(&team, &id)
             .await
             .map_err(fail(StatusCode::INTERNAL_SERVER_ERROR))?;
@@ -748,9 +743,6 @@ async fn import_cookies(Path(id): Path<String>, Json(body): Json<ImportCookiesRe
         ));
     }
     if let Some(team) = crate::team::active_team() {
-        if crate::is_profile_running(&id) {
-            return Err(err(StatusCode::CONFLICT, "stop the profile before importing cookies"));
-        }
         let bytes = serde_json::to_vec(&body.cookies)
             .map_err(fail(StatusCode::INTERNAL_SERVER_ERROR))?;
         let (_, etag) = crate::space::open::cookies_fetch(&team, &id)

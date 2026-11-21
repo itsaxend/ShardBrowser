@@ -2104,11 +2104,10 @@ pub fn is_profile_running(profile_id: &str) -> bool {
 
 #[tauri::command]
 async fn cookies_export(profile_id: String) -> Result<Vec<space::cookies::Cookie>, String> {
+    if is_profile_running(&profile_id) {
+        return Err("stop the profile before exporting cookies".into());
+    }
     if let Some(team) = crate::team::active_team() {
-        if is_profile_running(&profile_id) {
-            let pass = crate::space::open::cookie_pass(&team, &profile_id).await.map_err(|e| e.to_string())?;
-            return space::cookies::export(&pass).map_err(|e| e.to_string());
-        }
         let (blob, _) = crate::space::open::cookies_fetch(&team, &profile_id).await.map_err(|e| e.to_string())?;
         let cookies: Vec<space::cookies::Cookie> = blob
             .and_then(|b| serde_json::from_slice(&b).ok())

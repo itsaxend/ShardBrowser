@@ -3323,6 +3323,7 @@
   "useProfile.startedManyFailed": "Started {n} of {total} profiles. {failed} failed",
   "useProfile.startingMany": "Starting {done} of {total} profiles",
   "useProfile.stopBeforeCookieImport": "Stop the profile before importing cookies",
+  "useProfile.stopBeforeCookieExport": "Stop the profile before exporting cookies",
   "useProfile.stopFailed": "Couldn’t stop “{name}”",
   "useProfile.stopManyFailed": "Couldn’t stop {n} of {total} profiles",
   "useProfile.stoppedAnnounce": "Stopped “{name}”",
